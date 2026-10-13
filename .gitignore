@@ -1,0 +1,33 @@
+# Dependencias
+node_modules/
+
+# Compilacion
+dist/
+build/
+
+# Variables de entorno reales (NUNCA versionar)
+.env
+.env.local
+.env.*.local
+
+# Base de datos SQLite local
+*.sqlite
+*.sqlite-journal
+*.sqlite-shm
+*.sqlite-wal
+data/
+
+# Cobertura de pruebas
+coverage/
+
+# Logs
+*.log
+npm-debug.log*
+logs/
+
+# Sistema operativo / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.tsbuildinfo
