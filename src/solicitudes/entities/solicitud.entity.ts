@@ -2,10 +2,13 @@ import {
   Column,
   CreateDateColumn,
   Entity,
+  Index,
+  OneToMany,
   PrimaryGeneratedColumn,
   UpdateDateColumn,
 } from 'typeorm';
 import { EstadoSolicitud } from '../enums/estado-solicitud.enum.js';
+import { SolicitudHistorial } from './solicitud-historial.entity.js';
 
 @Entity('solicitudes')
 export class Solicitud {
@@ -18,9 +21,11 @@ export class Solicitud {
   @Column({ type: 'text' })
   descripcion: string;
 
-  @Column({ type: 'varchar', length: 60 })
-  asesor: string;
+  @Index()
+  @Column({ type: 'varchar', length: 60, nullable: true })
+  asesor: string | null;
 
+  @Index()
   @Column({
     type: 'simple-enum',
     enum: EstadoSolicitud,
@@ -28,9 +33,16 @@ export class Solicitud {
   })
   estado: EstadoSolicitud;
 
+  @Column({ type: 'integer', default: 1 })
+  version: number;
+
+  @Index()
   @CreateDateColumn({ type: 'datetime' })
   creadaEn: Date;
 
   @UpdateDateColumn({ type: 'datetime' })
   actualizadaEn: Date;
+
+  @OneToMany(() => SolicitudHistorial, (historial) => historial.solicitud)
+  historial: SolicitudHistorial[];
 }

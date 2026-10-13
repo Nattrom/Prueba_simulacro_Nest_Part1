@@ -137,7 +137,10 @@ src/
 │   ├── filters/
 │   │   └── http-exception.filter.ts
 │   ├── interfaces/
-│   │   └── authenticated-user.interface.ts
+│   │   ├── authenticated-user.interface.ts
+│   │   └── pagination.interface.ts
+│   ├── utils/
+│   │   └── normalize-text.ts      # Normalizacion de texto (RN-11)
 │   └── types/
 │       └── user-role.type.ts
 ├── users/
@@ -148,12 +151,16 @@ src/
     ├── solicitudes.controller.ts
     ├── solicitudes.service.ts
     ├── entities/
-    │   └── solicitud.entity.ts
+    │   ├── solicitud.entity.ts
+    │   └── solicitud-historial.entity.ts  # Auditoria persistente (RN-09)
     ├── enums/
-    │   └── estado-solicitud.enum.ts
+    │   ├── estado-solicitud.enum.ts
+    │   └── tipo-evento-historial.enum.ts
     └── dto/
         ├── create-solicitud.dto.ts
-        └── update-solicitud-status.dto.ts
+        ├── update-solicitud-status.dto.ts
+        ├── asignar-solicitud.dto.ts
+        └── query-solicitudes.dto.ts
 test/
 ├── jest-e2e.json
 ├── setup-env.ts
@@ -169,12 +176,27 @@ Todos los endpoints funcionales exigen `x-api-key` y `x-user`.
 | Metodo | Ruta | Descripcion | Roles |
 | --- | --- | --- | --- |
 | `POST` | `/solicitudes` | Registrar una solicitud | `admin`, `supervisor`, `asesor` |
-| `GET` | `/solicitudes` | Consultar solicitudes autorizadas | `admin`, `supervisor`, `asesor` |
+| `GET` | `/solicitudes` | Consultar solicitudes (filtros + paginacion) | `admin`, `supervisor`, `asesor` |
 | `GET` | `/solicitudes/:id` | Consultar una solicitud | `admin`, `supervisor`, `asesor` |
-| `PATCH` | `/solicitudes/:id/estado` | Cambiar el estado | `admin`, `supervisor`, `asesor` |
+| `GET` | `/solicitudes/:id/historial` | Consultar el historial de auditoria | `admin`, `supervisor`, `asesor` |
+| `PATCH` | `/solicitudes/:id/asignacion` | Asignar / reasignar asesor | `admin`, `supervisor` |
+| `PATCH` | `/solicitudes/:id/estado` | Cambiar el estado (con version) | `admin`, `supervisor`, `asesor` |
 | `GET` | `/api/docs` | Documentacion Swagger (ruta **deliberadamente no protegida**) | publica |
 
 La unica ruta excluida de los guards es `/api/docs`, para que el evaluador pueda consultar la documentacion. La excepcion se limita estrictamente a esa ruta.
+
+Parametros de consulta de `GET /solicitudes` (todos opcionales):
+
+| Parametro | Descripcion |
+| --- | --- |
+| `estado` | Filtra por estado exacto (`PENDIENTE`, `EN_GESTION`, `RESUELTA`). |
+| `asesor` | Filtra por asesor. Un `asesor` autenticado siempre queda restringido a su propio identificador. |
+| `cliente` | Coincidencia parcial (case-insensitive) sobre el nombre del cliente. |
+| `fechaDesde` / `fechaHasta` | Rango (ISO 8601) sobre `creadaEn`. |
+| `page` | Numero de pagina (desde 1). Por defecto `1`. |
+| `limit` | Registros por pagina (1 a 100). Por defecto `10`. |
+
+La respuesta paginada usa el formato `{ items, pagination: { page, limit, total, totalPages } }`.
 
 ---
 
@@ -183,13 +205,15 @@ La unica ruta excluida de los guards es `/api/docs`, para que el evaluador pueda
 ### RN-01. Registro (`POST /solicitudes`)
 - Cualquier usuario identificado puede registrar.
 - El estado inicial es **siempre** `PENDIENTE` (aunque el cliente intente otro).
-- Si el usuario es `asesor`, el campo `asesor` se asigna **automaticamente** a su propio identificador; no puede registrar a nombre de otro (HTTP 403).
-- Si el usuario es `admin`/`supervisor`, debe indicar `asesor`, y este debe existir con rol `asesor` (si no, HTTP 400).
-- El DTO no permite `id`, `estado`, `creadaEn` ni `actualizadaEn`; propiedades adicionales producen HTTP 400.
+- Si el usuario es `asesor`, la solicitud se asigna **automaticamente** a su propio identificador.
+- Si el usuario es `admin`/`supervisor`, la solicitud se crea **SIN asignacion** (`asesor: null`); su asignacion se realiza despues con `PATCH /solicitudes/:id/asignacion` (RN-07).
+- El campo `asesor` **no** se acepta en el cuerpo del registro (el DTO lo rechaza con HTTP 400).
+- El DTO no permite `id`, `estado`, `version`, `creadaEn` ni `actualizadaEn`; propiedades adicionales producen HTTP 400.
 
 ### RN-02. Consulta de solicitudes (`GET /solicitudes`)
 - `admin` y `supervisor`: todas las solicitudes.
 - `asesor`: solo las propias, con filtro aplicado **en la consulta TypeORM** (`where: { asesor }`), nunca filtrando en memoria.
+- Devuelve una estructura paginada `{ items, pagination }`.
 
 ### RN-03. Consulta individual (`GET /solicitudes/:id`)
 - `admin` y `supervisor`: cualquier solicitud.
@@ -199,7 +223,7 @@ La unica ruta excluida de los guards es `/api/docs`, para que el evaluador pueda
 ### RN-04. Cambio de estado (`PATCH /solicitudes/:id/estado`)
 - `admin` y `supervisor`: cualquier solicitud.
 - `asesor`: solo las propias (HTTP 403 si es ajena).
-- El cuerpo contiene **exclusivamente** `estado`.
+- El cuerpo contiene `estado` y `versionEsperada` (ver RN-10).
 - Transiciones permitidas:
   - `PENDIENTE` -> `EN_GESTION`
   - `EN_GESTION` -> `RESUELTA`
@@ -209,8 +233,10 @@ La unica ruta excluida de los guards es `/api/docs`, para que el evaluador pueda
 ### RN-05. Validacion
 - `ValidationPipe` global con `whitelist: true`, `forbidNonWhitelisted: true`, `transform: true`.
 - `cliente` y `descripcion`: obligatorios, texto no vacio, se recortan y no se aceptan solo espacios.
-- `asesor`: obligatorio cuando corresponde, con tipo/formato adecuado.
+- `asesor` (en RN-07): obligatorio, string.
 - `estado`: debe pertenecer al enum permitido.
+- `versionEsperada`: entero >= 1 y obligatorio en el cambio de estado.
+- `page`/`limit`: enteros, `page >= 1`, `1 <= limit <= 100`.
 - Errores de validacion => HTTP 400 con mensajes comprensibles.
 
 ### RN-06. Respuestas
@@ -232,17 +258,53 @@ Error uniforme:
 }
 ```
 
-Codigos: 400 validacion, 401 API Key/usuario, 403 permisos, 404 inexistente, 409 transicion invalida, 500 error interno. No se exponen trazas ni secretos.
+Codigos: 400 validacion, 401 API Key/usuario, 403 permisos, 404 inexistente, 409 transicion invalida o conflicto de version, 500 error interno. No se exponen trazas ni secretos.
+
+### RN-07. Asignacion y reasignacion (`PATCH /solicitudes/:id/asignacion`)
+- Solo `admin` y `supervisor` (un `asesor` recibe HTTP 403).
+- Cuerpo: `{ "asesor": "<id>" }`. El asesor debe existir con rol `asesor` (si no, HTTP 400).
+- Si la solicitud no existe, HTTP 404.
+- Si la solicitud esta `RESUELTA`, HTTP 409.
+- Si el asesor enviado coincide con el actual, la operacion no produce cambios ni evento de historial.
+- Cada asignacion efectiva registra un evento `ASIGNACION` en el historial (RN-09).
+
+### RN-08. Filtros y paginacion (`GET /solicitudes`)
+- Filtros opcionales combinables: `estado`, `asesor`, `cliente` (parcial), `fechaDesde`, `fechaHasta`.
+- Paginacion con `page` (desde 1) y `limit` (1 a 100); por defecto `page=1`, `limit=10`.
+- `total` y `totalPages` se calculan sobre el conjunto filtrado.
+- Un `asesor` autenticado ve **solo** sus solicitudes: el filtro `asesor` del cliente no puede ampliar su visibilidad.
+
+### RN-09. Historial de auditoria (`GET /solicitudes/:id/historial`)
+- Cada operacion relevante registra un evento **persistido** en la tabla `solicitud_historial`:
+  - `CREACION` al registrar,
+  - `ASIGNACION` al asignar/reasignar,
+  - `ESTADO` al cambiar de estado.
+- Cada evento guarda estado anterior/nuevo, asesor anterior/nuevo, usuario que ejecuto la accion, detalle y fecha.
+- La escritura del historial ocurre en la **misma transaccion** que la operacion: si falla, todo se revierte.
+- `admin` y `supervisor` consultan el historial de cualquier solicitud; `asesor` solo el de las propias (HTTP 403 si es ajena); HTTP 404 si la solicitud no existe.
+- Los eventos se devuelven en orden cronologico.
+
+### RN-10. Concurrencia optimista (`PATCH /solicitudes/:id/estado`)
+- La solicitud expone un entero `version` que inicia en `1`.
+- El cliente envia `versionEsperada` con la version que observo.
+- La actualizacion se realiza con una sentencia **condicional** (`WHERE id = :id AND version = :versionEsperada`) y luego incrementa `version` en 1.
+- Si la version no coincide (o la fila ya cambio entre la lectura y la escritura), devuelve HTTP 409 sin modificar datos.
+- Cambiar de estado es la unica operacion que incrementa `version`.
+
+### RN-11. Integridad y normalizacion
+- `cliente`, `descripcion`, `asesor` y los filtros de texto se **normalizan** (se colapsan espacios internos y se recortan los extremos) antes de persistir o consultar.
+- La asignacion valida la existencia del asesor contra el catalogo (integridad referencial a nivel de aplicacion).
+- El historial referencia la solicitud con clave foranea `ON DELETE CASCADE`.
 
 ---
 
 ## 11. Roles y permisos
 
-| Rol | Registrar | Ver todas | Ver propias | Cambiar estado (cualquiera) | Cambiar estado (propias) |
-| --- | --- | --- | --- | --- | --- |
-| `admin` | Si (indica asesor) | Si | Si | Si | Si |
-| `supervisor` | Si (indica asesor) | Si | Si | Si | Si |
-| `asesor` | Si (solo a si mismo) | No | Si | No | Si |
+| Rol | Registrar | Asignar / reasignar | Ver todas | Ver propias | Ver historial | Cambiar estado (cualquiera) | Cambiar estado (propias) |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `admin` | Si (sin asignar) | Si | Si | Si | Si | Si | Si |
+| `supervisor` | Si (sin asignar) | Si | Si | Si | Si | Si | Si |
+| `asesor` | Si (a si mismo) | No | No | Si | Solo propias | No | Si |
 
 El rol **nunca** se acepta desde el cliente: siempre proviene del catalogo interno resuelto por `x-user`.
 
@@ -265,7 +327,7 @@ Claves de API de ejemplo (`API_KEYS`): `clave-demo-uno`, `clave-demo-dos`.
 
 ## 13. Ejemplos de peticiones con curl
 
-Registrar una solicitud como asesor (el asesor se asigna solo):
+Registrar una solicitud como asesor (la solicitud se asigna solo):
 
 ```bash
 curl -X POST http://localhost:3000/solicitudes \
@@ -275,22 +337,40 @@ curl -X POST http://localhost:3000/solicitudes \
   -d '{"cliente":"Comercial Andina S.A.","descripcion":"Seguimiento de cotizacion"}'
 ```
 
-Registrar a nombre de un asesor como administrador:
+Registrar como administrador (queda SIN asignacion):
 
 ```bash
 curl -X POST http://localhost:3000/solicitudes \
   -H "x-api-key: clave-demo-uno" \
   -H "x-user: admin01" \
   -H "Content-Type: application/json" \
-  -d '{"cliente":"Distribuidora Sur","descripcion":"Renovacion de contrato","asesor":"asesor02"}'
+  -d '{"cliente":"Distribuidora Sur","descripcion":"Renovacion de contrato"}'
 ```
 
-Listar solicitudes como supervisor:
+Asignar la solicitud a un asesor (RN-07):
 
 ```bash
-curl http://localhost:3000/solicitudes \
+curl -X PATCH http://localhost:3000/solicitudes/3f1b2c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d/asignacion \
+  -H "x-api-key: clave-demo-uno" \
+  -H "x-user: admin01" \
+  -H "Content-Type: application/json" \
+  -d '{"asesor":"asesor02"}'
+```
+
+Listar solicitudes con filtros y paginacion (RN-08):
+
+```bash
+curl "http://localhost:3000/solicitudes?estado=PENDIENTE&asesor=asesor02&page=1&limit=10" \
   -H "x-api-key: clave-demo-uno" \
   -H "x-user: supervisor01"
+```
+
+Consultar el historial de auditoria (RN-09):
+
+```bash
+curl http://localhost:3000/solicitudes/3f1b2c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d/historial \
+  -H "x-api-key: clave-demo-uno" \
+  -H "x-user: admin01"
 ```
 
 Consultar una solicitud por id:
@@ -301,15 +381,17 @@ curl http://localhost:3000/solicitudes/3f1b2c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d \
   -H "x-user: asesor01"
 ```
 
-Cambiar el estado (transicion permitida):
+Cambiar el estado (transicion permitida, con version actual = 1):
 
 ```bash
 curl -X PATCH http://localhost:3000/solicitudes/3f1b2c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d/estado \
   -H "x-api-key: clave-demo-uno" \
   -H "x-user: asesor01" \
   -H "Content-Type: application/json" \
-  -d '{"estado":"EN_GESTION"}'
+  -d '{"estado":"EN_GESTION","versionEsperada":1}'
 ```
+
+Reintentar con una version obsoleta devuelve HTTP 409 (concurrencia optimista, RN-10).
 
 ---
 
@@ -326,26 +408,53 @@ curl -X PATCH http://localhost:3000/solicitudes/3f1b2c4d-5e6f-4a7b-8c9d-0e1f2a3b
     "descripcion": "Seguimiento de cotizacion",
     "asesor": "asesor01",
     "estado": "PENDIENTE",
+    "version": 1,
     "creadaEn": "2026-10-13T20:48:07.000Z",
     "actualizadaEn": "2026-10-13T20:48:07.000Z"
   }
 }
 ```
 
-`GET /solicitudes` (HTTP 200):
+`GET /solicitudes` (HTTP 200, formato paginado):
+
+```json
+{
+  "success": true,
+  "data": {
+    "items": [
+      {
+        "id": "35758f92-0f9b-41cf-9627-b3737573bfef",
+        "cliente": "Comercial Andina S.A.",
+        "descripcion": "Seguimiento de cotizacion",
+        "asesor": "asesor01",
+        "estado": "PENDIENTE",
+        "version": 1,
+        "creadaEn": "2026-10-13T20:48:07.000Z",
+        "actualizadaEn": "2026-10-13T20:48:07.000Z"
+      }
+    ],
+    "pagination": { "page": 1, "limit": 10, "total": 1, "totalPages": 1 }
+  }
+}
+```
+
+`GET /solicitudes/:id/historial` (HTTP 200):
 
 ```json
 {
   "success": true,
   "data": [
     {
-      "id": "35758f92-0f9b-41cf-9627-b3737573bfef",
-      "cliente": "Comercial Andina S.A.",
-      "descripcion": "Seguimiento de cotizacion",
-      "asesor": "asesor01",
-      "estado": "PENDIENTE",
-      "creadaEn": "2026-10-13T20:48:07.000Z",
-      "actualizadaEn": "2026-10-13T20:48:07.000Z"
+      "id": "9c8b7a6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d",
+      "solicitudId": "35758f92-0f9b-41cf-9627-b3737573bfef",
+      "tipoEvento": "CREACION",
+      "estadoAnterior": null,
+      "estadoNuevo": "PENDIENTE",
+      "asesorAnterior": null,
+      "asesorNuevo": "asesor01",
+      "usuario": "asesor01",
+      "detalle": "Solicitud registrada",
+      "fechaEvento": "2026-10-13T20:48:07.000Z"
     }
   ]
 }
@@ -404,6 +513,18 @@ Transicion invalida (HTTP 409):
 }
 ```
 
+Conflicto de version (HTTP 409, concurrencia optimista):
+
+```json
+{
+  "success": false,
+  "statusCode": 409,
+  "message": "La solicitud fue modificada por otro usuario. Consulte la version actual.",
+  "timestamp": "2026-10-13T20:48:07.000Z",
+  "path": "/solicitudes/3f1b2c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d/estado"
+}
+```
+
 ---
 
 ## 16. Acceso a Swagger
@@ -429,6 +550,8 @@ npm run test:e2e
 
 Las pruebas e2e usan SQLite `:memory:` (ver `test/setup-env.ts`), por lo que quedan aisladas de los datos de desarrollo. No dependen del orden de ejecucion. Cubren, entre otros: API Key ausente/invalida/valida, usuario inexistente, registro con `PENDIENTE`, campos protegidos, visibilidad por rol, 403/404/409, validacion de DTO, formato uniforme de respuestas y disponibilidad de Swagger.
 
+Para la Parte 2 se anadieron pruebas de: asignacion/reasignacion (RN-07), filtros y paginacion (RN-08), historial de auditoria persistente (RN-09), concurrencia optimista por version (RN-10) y normalizacion de texto (RN-11). Incluye una prueba de **rollback** que verifica que si falla el registro del historial, la transicion de estado se revierte por completo (transaccion de TypeORM).
+
 ---
 
 ## 18. Limitaciones de seguridad del mecanismo `x-user`
@@ -450,6 +573,10 @@ Las pruebas e2e usan SQLite `:memory:` (ver `test/setup-env.ts`), por lo que que
 6. **Autorizacion en la consulta:** el filtro del asesor se aplica en el `where` de TypeORM, no en memoria.
 7. **Respuestas uniformes:** interceptor global (`APP_INTERCEPTOR`) para exitos y exception filter global (`APP_FILTER`) para errores, preservando el codigo HTTP original.
 8. **Seguridad:** las API Keys provienen exclusivamente de `API_KEYS`; nunca se escriben claves en el codigo ni se registran en logs. Sin claves configuradas, el acceso se deniega.
+9. **Transacciones:** las operaciones que escriben (crear, asignar, cambiar estado) junto con su evento de historial se ejecutan dentro de `dataSource.transaction`. Si el historial falla, la operacion completa se revierte.
+10. **Concurrencia optimista:** el cambio de estado usa una actualizacion condicional (`WHERE version = :versionEsperada`) y luego incrementa `version`, evitando sobrescrituras silenciosas entre usuarios concurrentes.
+11. **Auditoria persistente:** el historial es una entidad real (`solicitud_historial`), no un log en memoria, con clave foranea a la solicitud y borrado en cascada.
+12. **Indices:** se indexan `estado`, `asesor` y `creadaEn` en `solicitudes`, y `(solicitudId, fechaEvento)` en el historial, para las consultas filtradas y el orden cronologico.
 
 ---
 
@@ -460,8 +587,9 @@ Comandos ejecutados y resultado real:
 ```bash
 npm install          # OK (se descargo el binario nativo de better-sqlite3)
 npm run build        # OK (sin errores de compilacion)
-npm test             # OK (3 suites, 20 pruebas)
-npm run test:e2e     # OK (1 suite, 26 pruebas)
+npm run lint         # OK (oxlint sin errores ni advertencias)
+npm test             # OK (3 suites, 32 pruebas)
+npm run test:e2e     # OK (1 suite, 48 pruebas)
 ```
 
 Arranque de humo de la version compilada (`node dist/main`) contra SQLite:
@@ -471,5 +599,10 @@ Arranque de humo de la version compilada (`node dist/main`) contra SQLite:
 - `GET /solicitudes` con usuario inexistente -> 401
 - `GET /api/docs` -> 200
 - `GET /api/docs-json` -> 200
-- `GET /solicitudes` como `admin01` -> 200 `{"success":true,"data":[]}`
-- `POST /solicitudes` como `asesor01` -> 201 con `estado: "PENDIENTE"` persistido
+- `GET /solicitudes` como `admin01` -> 200 `{"success":true,"data":{"items":[],"pagination":{...}}}`
+- `POST /solicitudes` como `asesor01` -> 201 con `estado: "PENDIENTE"`, `version: 1` y `asesor` propio
+- `POST /solicitudes` como `admin01` -> 201 con `asesor: null` (sin asignacion)
+- `PATCH /solicitudes/:id/asignacion` como `admin01` -> 200 con `asesor` actualizado
+- `GET /solicitudes/:id/historial` -> 200 con eventos `CREACION`/`ASIGNACION`
+- `PATCH /solicitudes/:id/estado` con `versionEsperada` correcta -> 200 con `version` incrementada
+- `PATCH /solicitudes/:id/estado` con `versionEsperada` obsoleta -> 409
